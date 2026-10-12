@@ -1,0 +1,4 @@
+ms-swift 4.2.0.dev0
+
+The Qwen2-Audio compatibility change is provided in
+patches/ms-swift-qwen2-audio.patch. The MS-Swift source tree is not included.

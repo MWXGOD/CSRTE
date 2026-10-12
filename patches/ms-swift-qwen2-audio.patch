@@ -1,0 +1,172 @@
+diff --git a/swift/template/templates/qwen.py b/swift/template/templates/qwen.py
+index 9413397..6a7920c 100644
+--- a/swift/template/templates/qwen.py
++++ b/swift/template/templates/qwen.py
+@@ -3,6 +3,7 @@ import inspect
+ import torch
+ import torch.nn.functional as F
+ import transformers
++from copy import deepcopy
+ from dataclasses import dataclass, field
+ from functools import partial
+ from packaging import version
+@@ -268,16 +269,145 @@ class Qwen2AudioTemplate(Template):
+         else:
+             return [f'Audio {index + 1}: <|audio_bos|><|AUDIO|><|audio_eos|>\n']
+ 
++    def _get_processor_call_config(self) -> Dict[str, Any]:
++        processor_parameters = inspect.signature(self.processor.__call__).parameters
++        has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in processor_parameters.values())
++        if 'audio' in processor_parameters:
++            audio_key = 'audio'
++        elif 'audios' in processor_parameters or has_var_kwargs:
++            audio_key = 'audios'
++        else:
++            audio_key = 'audio'
++        return {
++            'audio_key': audio_key,
++            'supports_text_kwargs': 'text_kwargs' in processor_parameters or has_var_kwargs,
++            'supports_return_attention_mask': 'return_attention_mask' in processor_parameters,
++        }
++
++    def _build_processor_kwargs(self,
++                                context: str,
++                                context_audios: List[Any],
++                                processor_config: Dict[str, Any]) -> Dict[str, Any]:
++        processor_kwargs = {
++            'text': context,
++            'sampling_rate': self.sampling_rate,
++            'return_tensors': 'pt',
++        }
++        processor_kwargs[processor_config['audio_key']] = context_audios
++        if processor_config['supports_text_kwargs']:
++            processor_kwargs['text_kwargs'] = {'add_special_tokens': False}
++        else:
++            processor_kwargs['add_special_tokens'] = False
++        return processor_kwargs
++
++    def _encode_context_list_with_processor(self,
++                                            context_list: List[Context],
++                                            loss_scale_list: Optional[List[float]] = None,
++                                            audios: Optional[List[Any]] = None) -> Dict[str, Any]:
++        input_ids: List[int] = []
++        labels: List[int] = []
++        loss_scale: List[float] = []
++        if loss_scale_list is None:
++            loss_scale_list = [0.] * len(context_list)
++        audios = audios or []
++        audio_idx = 0
++        audio_token_id = self._tokenize('<|AUDIO|>')[0]
++        input_features = []
++        feature_attention_mask = []
++        processor_config = self._get_processor_call_config()
++
++        for context, loss_weight in zip(context_list, loss_scale_list):
++            if isinstance(context, str) and '<|AUDIO|>' in context:
++                num_audios = context.count('<|AUDIO|>')
++                context_audios = audios[audio_idx:audio_idx + num_audios]
++                audio_idx += num_audios
++                if not context_audios:
++                    raise ValueError(f'Audio placeholder found but no audio data is available. context: {context!r}')
++
++                processor_kwargs = self._build_processor_kwargs(context, context_audios, processor_config)
++                processor_outputs = self.processor(**processor_kwargs)
++                torch_dtype = getattr(getattr(self, 'model_info', None), 'torch_dtype', None)
++                if torch_dtype is not None:
++                    processor_outputs = to_float_dtype(processor_outputs, torch_dtype)
++                token_list = processor_outputs['input_ids'][0].tolist()
++                if processor_outputs.get('input_features') is not None:
++                    input_features.append(processor_outputs['input_features'])
++                if processor_outputs.get('feature_attention_mask') is not None:
++                    feature_attention_mask.append(processor_outputs['feature_attention_mask'])
++            elif isinstance(context, str):
++                token_list = self._tokenize(context)
++            else:
++                token_list = context
++                # A generated response can occasionally contain the audio placeholder token.
++                # It has no matching audio feature and would make Qwen2-Audio fail in forward.
++                if audio_token_id in token_list:
++                    token_list = [token for token in token_list if token != audio_token_id]
++
++            input_ids += token_list
++            if loss_weight > 0.0:
++                token_labels = token_list.copy()
++                if isinstance(context, str) and '<|AUDIO|>' in context:
++                    token_labels = [token if token != audio_token_id else -100 for token in token_labels]
++                labels += token_labels
++            else:
++                labels += [-100] * len(token_list)
++            if not self.loss_scale.is_loss_scale_binary:
++                loss_scale.extend([loss_weight] * len(token_list))
++
++        if audio_idx != len(audios):
++            raise ValueError(f'Audio count mismatch: consumed {audio_idx}, but received {len(audios)}.')
++
++        if self.loss_scale.is_loss_scale_binary:
++            loss_scale = None
++
++        encoded = {'input_ids': input_ids, 'labels': labels, 'loss_scale': loss_scale}
++        if input_features:
++            encoded['input_features'] = torch.concat(input_features)
++        if feature_attention_mask:
++            encoded['feature_attention_mask'] = torch.concat(feature_attention_mask)
++        return encoded
++
+     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+-        encoded = super()._encode(inputs)
+-        if inputs.audios:
+-            audios = load_batch(inputs.audios, load_func=partial(load_audio, sampling_rate=self.sampling_rate))
+-            audio_inputs = self.processor.feature_extractor(
+-                audios, sampling_rate=self.sampling_rate, return_attention_mask=True, return_tensors='pt')
+-            audio_inputs['feature_attention_mask'] = audio_inputs.pop('attention_mask')
+-            encoded.update(audio_inputs)
++        if not inputs.audios:
++            return super()._encode(inputs)
++
++        inputs.messages = deepcopy(inputs.messages)
++        template_backend = self.template_backend
++        if (self.template_meta.template_type == 'dummy' and self.use_chat_template and not self.is_training
++                and self.task_type == 'causal_lm'):
++            template_backend = 'jinja'
++        self._swift_prepare_inputs(inputs)
++        res_context_list, loss_scale_list, _ = (
++            self._swift_encode(inputs) if template_backend == 'swift' else self._jinja_encode(inputs))
++        res_context_list, loss_scale_list = self._simplify_context_list(res_context_list, loss_scale_list, inputs)
++        audios = load_batch(inputs.audios, load_func=partial(load_audio, sampling_rate=self.sampling_rate))
++        encoded = self._encode_context_list_with_processor(res_context_list, loss_scale_list, audios)
++        self._add_dynamic_eos(encoded['input_ids'], encoded['labels'], encoded['loss_scale'],
++                              self._encode_context_list(self.template_meta.suffix)[0])
++        if encoded.get('labels') is not None:
++            encoded['labels'][0] = -100
++        if encoded.get('loss_scale') is not None:
++            encoded['loss_scale'][0] = 0
++        if not self.is_training:
++            for k in list(encoded.keys()):
++                if k.endswith('labels') or k.endswith('loss_scale'):
++                    encoded[k] = None
+         return encoded
+ 
++    def _maybe_add_return_legacy_cache(self, generate_kwargs: Dict[str, Any], *, model=None) -> Dict[str, Any]:
++        if model is None:
++            return generate_kwargs
++        base_model = self.get_base_model(model)
++        signature = inspect.signature(base_model.generate)
++        if 'return_legacy_cache' in signature.parameters and 'return_legacy_cache' not in generate_kwargs:
++            generate_kwargs = generate_kwargs.copy()
++            generate_kwargs['return_legacy_cache'] = True
++        return generate_kwargs
++
++    def prepare_generate_kwargs(self, generate_kwargs: Dict[str, Any], *, model=None) -> Dict[str, Any]:
++        generate_kwargs = super().prepare_generate_kwargs(generate_kwargs, model=model)
++        return self._maybe_add_return_legacy_cache(generate_kwargs, model=model)
++
+     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+         res = super()._data_collator(batch, padding_to=padding_to)
+         input_features = [b['input_features'] for b in batch if b.get('input_features') is not None]
+@@ -1303,4 +1433,4 @@ YUFENG_XGUARD_TEMPLATE = ('<|im_start|>user\n'
+ register_template(Qwen3MixedTemplateMeta(
+     LLMTemplateType.yufeng_xguard,
+     prompt=[YUFENG_XGUARD_TEMPLATE],
+-))
+\ No newline at end of file
++))
