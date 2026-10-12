@@ -2,9 +2,7 @@
 
 ## An Acoustic-Cue and Contextual-Knowledge Reasoning Enhancement Framework for Speech Relation Extraction
 
-This repository contains the compact release of **ACRE**, the CSRTE speech relation extraction system. ACRE fine-tunes Qwen2-Audio with LoRA SFT and GRPO, and uses pronunciation, pause, entity, relation, and triplet signals during optimization.
-
-The repository contains the project-specific code, the Qwen2-Audio MS-Swift patch, the CSRTE JSONL data splits, and runnable training/evaluation scripts. The MS-Swift framework and audio files are not included.
+ACRE fine-tunes Qwen2-Audio with LoRA SFT and GRPO, and uses pronunciation, pause, entity, relation, and triplet signals during optimization.
 
 ## Overview
 
@@ -42,7 +40,7 @@ release/
 │   ├── train.jsonl               # Training split
 │   ├── dev.jsonl                 # Development split
 │   ├── test.jsonl                # Test split
-│   └── audio/                    # Audio files should be placed here later
+│   └── audio/                    # Audio files
 ├── patches/
 │   └── ms-swift-qwen2-audio.patch
 ├── requirements/
@@ -77,10 +75,6 @@ Each row uses the MS-Swift multimodal conversation format:
 }
 ```
 
-The `audio/` directory is intentionally empty in this release. Update the `audios` paths in the JSONL files, or place the corresponding audio files at the referenced paths before training.
-
-The three included files are ordinary conversation/SFT data. GRPO requires a separate JSONL version with a top-level `solution` field; pass that file through `GRPO_DATASET` when running `scripts/train_grpo.sh`.
-
 ## Environment
 
 Create an environment and install MS-Swift separately:
@@ -107,8 +101,6 @@ ${EDITOR:-vi} configs/paths.env
 source configs/paths.env
 ```
 
-At minimum, set `BASE_MODEL`, `DATA_ROOT`, and `OUTPUT_ROOT`. For this release, `DATA_ROOT` can point to `release/data`.
-
 ## Training
 
 ### SFT
@@ -129,43 +121,4 @@ GRPO starts from an SFT adapter and needs data containing `solution` references:
 export SFT_ADAPTER=/path/to/sft/checkpoint
 export GRPO_DATASET=/path/to/train_grpo.jsonl
 bash scripts/train_grpo.sh
-```
-
-The release reward is registered as `speechre_acre_reward`. Dynamic sampling is disabled in the provided command.
-
-## Evaluation
-
-Evaluate a saved adapter or checkpoint on the included test split:
-
-```bash
-bash scripts/evaluate.sh /path/to/checkpoint test
-```
-
-For the development split:
-
-```bash
-bash scripts/evaluate.sh /path/to/checkpoint dev
-```
-
-The evaluator reports strict entity, relation, and triplet precision/recall/F1, together with pronunciation-aware entity matching (PAE). Results are written below `${OUTPUT_ROOT}/eval`.
-
-## Main Results
-
-The final ACRE-Qwen2-Audio-7B results reported in the paper are:
-
-| Dataset | Entity F1 | Relation F1 | Triplet F1 |
-| --- | ---: | ---: | ---: |
-| CoNLL04 | 58.09 | 87.14 | 42.07 |
-| Common Voice | 53.66 | 69.58 | 30.41 |
-| CSRTE | 53.96 | 78.25 | 34.90 |
-
-On CSRTE, PAE improves entity F1 to 62.45 and triplet F1 to 42.26.
-
-## Citation
-
-If you use this code or the ACRE method, please cite the accompanying paper:
-
-```text
-ACRE: An Acoustic-Cue and Contextual-Knowledge Reasoning Enhancement
-Framework for Speech Relation Extraction.
 ```
